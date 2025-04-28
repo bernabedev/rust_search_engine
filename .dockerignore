@@ -1,0 +1,21 @@
+# Git files
+.git
+.gitignore
+
+# Docker files
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# Rust build artifacts
+target/
+
+# Local environment files (if any)
+.env*
+
+# Editor/OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

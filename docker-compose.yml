@@ -1,0 +1,19 @@
+services:
+  search_engine:
+    container_name: rust-search-engine-app # Explicit container name
+    image: rust-search-engine:latest # Optional: Tag the image being built
+    build:
+      context: . # Use the current directory as the build context
+      dockerfile: Dockerfile # Specify the Dockerfile name
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=info,api=debug
+    restart: unless-stopped # Restart policy
+    healthcheck:
+      # Check if the /health endpoint is responding
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 15s # Check every 15 seconds
+      timeout: 5s # Wait max 5 seconds for response
+      retries: 3 # Try 3 times before marking as unhealthy
+      start_period: 20s # Grace period after container starts
