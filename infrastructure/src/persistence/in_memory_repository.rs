@@ -130,4 +130,26 @@ impl DocumentRepository for InMemoryDocumentRepository {
             Ok(false) // Collection or document doesn't exist
         }
     }
+    /// Optimized batch save for in-memory store.
+    #[instrument(skip(self, documents))]
+    async fn save_batch(
+        &self,
+        collection_name: &str,
+        documents: &[Document],
+    ) -> Result<(), ApplicationError> {
+        debug!(collection = %collection_name, count = documents.len(), "Saving batch directly to in-memory store");
+        // Get or create the inner map for the collection
+        let collection_store = self
+            .store
+            .entry(collection_name.to_string())
+            .or_insert_with(DashMap::new);
+
+        // Insert all documents. DashMap operations are generally thread-safe and efficient.
+        // We could potentially use `extend` if the input was consumable, but insert loop is fine.
+        for doc in documents {
+            collection_store.insert(doc.id().clone(), Arc::new(doc.clone()));
+        }
+        // In-memory operations are unlikely to fail here unless OOM.
+        Ok(())
+    }
 }

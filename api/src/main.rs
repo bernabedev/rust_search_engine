@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 // Import updated application layer components
 use application::{
     ApplicationError, // Base error type
+    BatchResponse,
     CollectionResponse,
     // DTOs / Requests / Responses
     IndexDocumentRequest,
@@ -99,6 +100,10 @@ async fn main() {
             "/collections/:collection_name/documents",
             post(index_document_handler),
         ) // Index doc in collection
+        .route(
+            "/collections/:collection_name/documents/batch",
+            post(index_batch_handler),
+        ) // Index batch of docs in collection
         // .route("/collections/:collection_name/documents/:doc_id", get(get_document_handler)) // TODO: Add later
         .route(
             "/collections/:collection_name/documents/:doc_id",
@@ -253,6 +258,54 @@ async fn index_document_handler(
         }
         Err(e) => {
             error!(collection = %collection_name, "Failed to index document via handler: {}", e);
+            map_application_error_to_response(e)
+        }
+    }
+}
+
+async fn index_batch_handler(
+    State(state): State<AppState>,
+    Path(collection_name): Path<String>,
+    // Directly deserialize the JSON array body into Vec<IndexDocumentRequest>
+    Json(batch_payload): Json<Vec<IndexDocumentRequest>>,
+) -> Response {
+    let batch_size = batch_payload.len(); // Get size for logging before moving
+    info!(collection = %collection_name, batch_size = batch_size, "Received request to index batch documents");
+
+    if batch_size == 0 {
+        warn!(collection = %collection_name, "Received empty batch request array.");
+        // Return OK but indicate zero processed, or Bad Request? Let's go with OK.
+        return (
+            StatusCode::OK,
+            JsonResponse(BatchResponse {
+                total_processed: 0,
+                successful: 0,
+                failed: 0,
+            }),
+        )
+            .into_response();
+    }
+
+    match state
+        .indexing_service
+        .index_batch(&collection_name, batch_payload)
+        .await
+    {
+        Ok(batch_response) => {
+            // Batch processed, even if some might have failed validation (though current logic fails entire batch on validation error)
+            info!(collection = %collection_name, processed = batch_response.total_processed, successful = batch_response.successful, "Batch processed successfully via handler");
+            // Use status code 200 OK or 207 Multi-Status if supporting partial success later.
+            // For now, 200 OK signifies the batch request was accepted and processed (even if 0 succeeded).
+            (StatusCode::OK, JsonResponse(batch_response)).into_response()
+        }
+        Err(e @ ApplicationError::InvalidInput(_)) => {
+            // Specific handling for validation errors from the batch
+            error!(collection = %collection_name, "Batch indexing failed due to validation errors: {}", e);
+            map_application_error_to_response(e) // Let the helper handle 400 Bad Request
+        }
+        Err(e) => {
+            // Handle infrastructure errors or other unexpected issues during batch processing
+            error!(collection = %collection_name, "Batch indexing failed via handler: {}", e);
             map_application_error_to_response(e)
         }
     }

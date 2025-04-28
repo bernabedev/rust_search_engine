@@ -163,4 +163,31 @@ impl Index for InMemoryIndex {
             Ok(())
         }
     }
+
+    /// Optimized batch index for in-memory store.
+    #[instrument(skip(self, documents))]
+    async fn index_batch(
+        &self,
+        collection_name: &str,
+        documents: &[Document],
+    ) -> Result<(), ApplicationError> {
+        debug!(collection = %collection_name, count = documents.len(), "Indexing batch directly in in-memory index");
+        match self.collections.get(collection_name) {
+            Some(collection_data) => {
+                // Insert all documents into the collection's document map
+                for doc in documents {
+                    collection_data
+                        .documents
+                        .insert(doc.id().clone(), Arc::new(doc.clone()));
+                }
+                Ok(())
+            }
+            None => {
+                warn!(collection = %collection_name, "Attempted to index batch into non-existent collection index");
+                Err(ApplicationError::CollectionNotFound(
+                    collection_name.to_string(),
+                ))
+            }
+        }
+    }
 }

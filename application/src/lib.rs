@@ -2,11 +2,13 @@
 use async_trait::async_trait;
 // Import updated domain types and new errors
 use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldDefinition, FieldType};
+// use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
-use serde_json::Value; // For flexible document data
+use serde_json::Value;
 use std::collections::HashMap; // For document fields map
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::futures; // For flexible document data
 use tracing::{debug, error, info, instrument, warn};
 
 // --- Application Errors ---
@@ -74,7 +76,21 @@ pub trait DocumentRepository: Send + Sync {
         collection_name: &str,
         id: &DocumentId,
     ) -> Result<bool, ApplicationError>;
-    // Maybe add list/delete_all for a collection later
+    /// Adds or updates multiple documents efficiently.
+    #[instrument(skip(self, documents))]
+    async fn save_batch(
+        &self,
+        collection_name: &str,
+        documents: &[Document],
+    ) -> Result<(), ApplicationError> {
+        debug!(collection = %collection_name, count = documents.len(), "Saving batch via default iteration");
+        // Simple default: call save sequentially for each document
+        for doc in documents {
+            // If one fails, should we stop or continue? Stop for now.
+            self.save(collection_name, doc).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Interface for the search index (now collection-aware).
@@ -106,6 +122,20 @@ pub trait Index: Send + Sync {
     ) -> Result<Vec<Document>, ApplicationError>;
     /// Deletes an entire collection from the index.
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError>;
+    /// Indexes multiple documents efficiently.
+    #[instrument(skip(self, documents))]
+    async fn index_batch(
+        &self,
+        collection_name: &str,
+        documents: &[Document],
+    ) -> Result<(), ApplicationError> {
+        debug!(collection = %collection_name, count = documents.len(), "Indexing batch via default iteration");
+        // Simple default: call index_document sequentially
+        for doc in documents {
+            self.index_document(collection_name, doc).await?;
+        }
+        Ok(())
+    }
 }
 
 // --- Request/Response Models (Data Transfer Objects - DTOs) ---
@@ -131,6 +161,13 @@ pub struct IndexDocumentRequest {
     pub id: String,
     /// The fields of the document as a JSON object.
     pub fields: HashMap<String, Value>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct BatchResponse {
+    pub total_processed: usize,
+    pub successful: usize,
+    pub failed: usize,
 }
 
 // SearchRequest remains the same (just a query string)
@@ -395,6 +432,128 @@ impl IndexingService {
                 )))
             }
         }
+    }
+    /// Handles indexing a batch of documents.
+    /// This implementation validates all documents first. If all are valid,
+    /// it attempts to save and index them in batches using the repository/index traits.
+    /// It currently fails the entire batch if any infrastructure operation fails.
+    #[instrument(skip(self, batch_request), fields(collection = %collection_name, batch_size = batch_request.len()))]
+    pub async fn index_batch(
+        &self,
+        collection_name: &str,
+        batch_request: Vec<IndexDocumentRequest>, // Directly use Vec
+    ) -> Result<BatchResponse, ApplicationError> {
+        // Return BatchResponse on success
+        info!("Attempting to index batch of documents");
+
+        if batch_request.is_empty() {
+            warn!("Received an empty batch request.");
+            return Ok(BatchResponse {
+                total_processed: 0,
+                successful: 0,
+                failed: 0,
+            });
+        }
+
+        // 1. Get the schema for the collection
+        let schema = self
+            .schema_repo
+            .get(collection_name)
+            .await?
+            .ok_or_else(|| {
+                warn!(collection = %collection_name, "Batch indexing failed: collection not found");
+                ApplicationError::CollectionNotFound(collection_name.to_string())
+            })?;
+        let schema_arc = Arc::new(schema); // Put schema in Arc for sharing across potential concurrent validations
+
+        // 2. Validate all documents in the batch
+        let total_processed = batch_request.len();
+        let mut valid_documents = Vec::with_capacity(total_processed);
+        let mut validation_errors = Vec::new();
+
+        // --- Validation ---
+        // You could potentially parallelize validation using something like futures::stream::iter + map + try_collect
+        // For simplicity, let's do it sequentially first.
+        for (index, request) in batch_request.into_iter().enumerate() {
+            let doc_id_str = request.id.clone(); // Clone ID for error reporting
+            let doc_id = DocumentId::new(request.id);
+            match Document::new(doc_id.clone(), request.fields, &schema_arc) {
+                Ok(doc) => {
+                    valid_documents.push(doc);
+                }
+                Err(domain_err) => {
+                    let error_msg = format!(
+                        "Document at index {} (ID: '{}') failed validation: {}",
+                        index, doc_id_str, domain_err
+                    );
+                    warn!("{}", error_msg); // Log validation failure
+                    validation_errors.push(error_msg);
+                    // Decide on batch failure strategy. Let's collect all errors and fail if any exist.
+                }
+            }
+        }
+
+        // --- Handle Validation Results ---
+        if !validation_errors.is_empty() {
+            let combined_error_message = validation_errors.join("; ");
+            error!(
+                "Batch validation failed for {} documents. Errors: {}",
+                validation_errors.len(),
+                combined_error_message
+            );
+            // Return a clear input error indicating validation failure
+            return Err(ApplicationError::InvalidInput(format!(
+                "Batch contained {} validation errors. First error: {}",
+                validation_errors.len(),
+                validation_errors
+                    .first()
+                    .unwrap_or(&"Unknown validation error".to_string()) // Provide first error detail
+            )));
+        }
+
+        // If we reach here, all documents passed validation.
+        debug!(
+            "All {} documents in the batch passed validation.",
+            valid_documents.len()
+        );
+
+        // 3. Save the batch to the primary repository
+        if let Err(e) = self
+            .doc_repo
+            .save_batch(collection_name, &valid_documents)
+            .await
+        {
+            error!(collection = %collection_name, count = valid_documents.len(), "Failed to save document batch to repository: {}", e);
+            // Fail the whole batch if repo save fails. Need better transactionality later.
+            return Err(ApplicationError::InfrastructureError(format!(
+                "Repository batch save failed: {}",
+                e
+            )));
+        }
+        info!(collection = %collection_name, count = valid_documents.len(), "Document batch saved to repository successfully");
+
+        // 4. Add the batch to the search index
+        if let Err(e) = self
+            .index
+            .index_batch(collection_name, &valid_documents)
+            .await
+        {
+            error!(collection = %collection_name, count = valid_documents.len(), "Failed to index document batch: {}", e);
+            // Fail the whole batch if index fails. Repo save already happened - inconsistency!
+            // TODO: Implement compensation logic (e.g., attempt to delete saved docs) or use 2PC/Sagas pattern.
+            return Err(ApplicationError::IndexError {
+                collection: collection_name.to_string(),
+                source: Box::new(e), // Assuming e implements Error + Send + Sync
+            });
+        }
+        info!(collection = %collection_name, count = valid_documents.len(), "Document batch indexed successfully");
+
+        // If all steps succeed
+        Ok(BatchResponse {
+            total_processed,
+            successful: valid_documents.len(), // Should equal total_processed if no errors occurred before infra calls
+            failed: 0, // We are failing the whole batch on infra error currently
+        })
     }
 }
 
