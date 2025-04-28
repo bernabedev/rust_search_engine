@@ -215,4 +215,15 @@ impl Index for InMemoryIndex {
             }
         }
     }
+
+    /// Gets the total number of documents across all collections in the in-memory index.
+    async fn get_total_document_count(&self) -> Result<usize, ApplicationError> {
+        // Sum the number of documents in each collection's DashMap
+        let total_count = self
+            .collections
+            .iter() // Iterate over collections (DashMap entries)
+            .map(|collection_entry| collection_entry.value().documents.len()) // Get count for each collection
+            .sum(); // Sum the counts
+        Ok(total_count)
+    }
 }

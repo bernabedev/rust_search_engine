@@ -13,6 +13,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1.0"
 async-trait = "0.1"
+sysinfo = { version = "0.34" }
 
 [profile.release]
 # Optimization settings for release builds (important for performance)

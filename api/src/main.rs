@@ -26,6 +26,7 @@ use application::{
     SchemaService,
     SearchRequest, // Existing modified
     SearchService,
+    StatsService,
 };
 // Import domain types used directly in API (like CollectionSchema for POST body)
 use domain::CollectionSchema;
@@ -38,6 +39,7 @@ struct AppState {
     schema_service: Arc<SchemaService>,
     indexing_service: Arc<IndexingService>,
     search_service: Arc<SearchService>,
+    stats_service: Arc<StatsService>,
 }
 
 // Application entry point
@@ -76,6 +78,11 @@ async fn main() {
         schema_repository.clone(), // SearchService also needs schema repo
         index.clone(),
     ));
+
+    let stats_service = Arc::new(StatsService::new(
+        schema_repository.clone(),
+        index.clone(), // TODO: Pass data path later
+    ));
     info!("Application services initialized.");
 
     // 3. Create the application state
@@ -83,12 +90,14 @@ async fn main() {
         schema_service,
         indexing_service,
         search_service,
+        stats_service,
     };
     info!("Application state created.");
 
     // --- API Router Definition ---
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/stats", get(get_stats_handler))
         // Collection Management Endpoints
         .route("/collections", post(create_collection_handler)) // Create a new collection
         .route("/collections", get(list_collections_handler)) // List all collections
@@ -355,6 +364,18 @@ async fn search_documents_handler(
         }
         Err(e) => {
             error!(collection = %collection_name, "Failed to search documents via handler: {}", e);
+            map_application_error_to_response(e)
+        }
+    }
+}
+
+async fn get_stats_handler(State(state): State<AppState>) -> Response {
+    info!("Received request to get statistics");
+    match state.stats_service.get_stats().await {
+        Ok(stats_response) => (StatusCode::OK, JsonResponse(stats_response)).into_response(),
+        Err(e) => {
+            error!("Failed to get statistics via handler: {}", e);
+            // Use the existing mapper, InfrastructureError should map to 500
             map_application_error_to_response(e)
         }
     }

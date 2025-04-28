@@ -1,14 +1,12 @@
-// ./application/src/lib.rs
 use async_trait::async_trait;
-// Import updated domain types and new errors
 use domain::{CollectionSchema, Document, DocumentId, DomainError};
-// use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Instant}; // For document fields map
+use sysinfo::{Disks, MemoryRefreshKind, Pid, System};
 use thiserror::Error;
-// For flexible document data
 use tracing::{debug, error, info, instrument, warn};
 
 // --- Application Errors ---
@@ -49,6 +47,51 @@ pub struct SearchResult {
     pub total_hits: usize,
     // Optional: Add index processing time later if needed
     // pub index_processing_time_ms: u128,
+}
+
+#[derive(Serialize, Debug)]
+pub struct MemoryStats {
+    total_bytes: u64,
+    used_bytes: u64,         // Physical memory used by all processes
+    free_bytes: u64,         // Physical memory free
+    available_bytes: u64,    // Memory available without swapping
+    process_used_bytes: u64, // Memory used by this specific search engine process
+}
+
+#[derive(Serialize, Debug)]
+pub struct DiskStats {
+    disk_path: String, // Path of the disk being reported (e.g., where data resides)
+    total_bytes: u64,
+    available_bytes: u64,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CpuStats {
+    num_cores: usize,
+    load_average_one_minute: f64,
+}
+#[derive(Serialize, Debug)]
+pub struct EngineStats {
+    total_collections: usize,
+    total_documents: usize,
+    // index_size_bytes: u64, // TODO: Get actual size from Index trait later
+}
+
+#[derive(Serialize, Debug)]
+pub struct SystemInfo {
+    os_name: String,
+    os_version: String,
+    // kernel_version: String,
+}
+
+/// Response for the /stats endpoint.
+#[derive(Serialize, Debug)]
+pub struct StatsResponse {
+    system_info: SystemInfo,
+    memory: MemoryStats,
+    // cpu: CpuStats, // Add later
+    disk: DiskStats, // Reporting disk where the engine runs for now
+    engine: EngineStats,
 }
 
 /// Interface for storing and retrieving Collection Schemas.
@@ -147,6 +190,8 @@ pub trait Index: Send + Sync {
         }
         Ok(())
     }
+    /// Returns the total number of documents in the index.
+    async fn get_total_document_count(&self) -> Result<usize, ApplicationError>;
 }
 
 // --- Request/Response Models (Data Transfer Objects - DTOs) ---
@@ -709,5 +754,132 @@ impl SearchService {
                 })
             }
         }
+    }
+}
+
+pub struct StatsService {
+    schema_repo: Arc<dyn SchemaRepository>,
+    index: Arc<dyn Index>,
+    // data_path: PathBuf, // TODO: Inject configured data path later for accurate disk stats
+}
+
+impl StatsService {
+    pub fn new(schema_repo: Arc<dyn SchemaRepository>, index: Arc<dyn Index>) -> Self {
+        Self { schema_repo, index }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get_stats(&self) -> Result<StatsResponse, ApplicationError> {
+        info!("Gathering engine and system statistics");
+
+        // --- Gather Engine Stats (Async Part) ---
+        let collections_future = self.schema_repo.list();
+        let documents_future = self.index.get_total_document_count();
+        let (collections_result, documents_result) =
+            tokio::join!(collections_future, documents_future);
+
+        // Handle results... (same as before)
+        let collections = collections_result.map_err(|e| {
+            error!("Failed to list collections for stats: {}", e);
+            ApplicationError::InfrastructureError("Failed to retrieve collection count".to_string())
+        })?;
+        let total_documents = documents_result.map_err(|e| {
+            error!("Failed to get total document count for stats: {}", e);
+            ApplicationError::InfrastructureError("Failed to retrieve document count".to_string())
+        })?;
+
+        let engine_stats = EngineStats {
+            total_collections: collections.len(),
+            total_documents,
+        };
+        debug!("Engine stats gathered: {:?}", engine_stats);
+
+        // --- Gather System Stats (Sync Part in Blocking Task) ---
+        let sys_info_result = tokio::task::spawn_blocking(move || {
+            // Use new_all() to ensure processes/CPUs list is initially populated
+            // Keep this instance local to the blocking task
+            let mut sys = System::new_all();
+
+            // Refresh specific data needed
+            sys.refresh_memory_specifics(MemoryRefreshKind::everything());
+            // sys.refresh_cpu_usage(); // Only if CPU stats are needed later
+            // No need to refresh processes list if new_all() was used, but refresh process data if needed
+            // sys.refresh_process(Pid::current().unwrap()); // Refresh current process data specifically if needed
+
+            // Get Disks information using the separate Disks struct
+            let disks = Disks::new_with_refreshed_list(); // Refreshes list and stats
+
+            // --- Memory Stats ---
+            // Get current PID using std::process::id()
+            let current_pid = Pid::from(std::process::id() as usize);
+            let process_memory = sys
+                .process(current_pid) // Use Pid::current() result
+                .map_or(0, |p| p.memory());
+
+            let memory_stats = MemoryStats {
+                total_bytes: sys.total_memory(),
+                used_bytes: sys.used_memory(),
+                free_bytes: sys.free_memory(),
+                available_bytes: sys.available_memory(),
+                process_used_bytes: process_memory,
+            };
+
+            // --- Disk Stats ---
+            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            let mut current_disk_stats = DiskStats {
+                disk_path: "unknown".to_string(),
+                total_bytes: 0,
+                available_bytes: 0,
+            };
+            let mut best_match_len = 0;
+
+            // Iterate over the disks obtained from the Disks struct
+            for disk in &disks {
+                // <-- Iterate over the `disks` instance
+                let mount_point = disk.mount_point();
+                if current_dir.starts_with(mount_point) {
+                    let mount_point_len = mount_point.as_os_str().len();
+                    if mount_point_len > best_match_len {
+                        best_match_len = mount_point_len;
+                        current_disk_stats = DiskStats {
+                            disk_path: mount_point.to_string_lossy().into_owned(),
+                            total_bytes: disk.total_space(),
+                            available_bytes: disk.available_space(),
+                        };
+                    }
+                }
+            }
+
+            // --- System Info ---
+            // These are static methods, no refresh needed on the instance
+            let system_info = SystemInfo {
+                os_name: System::name().unwrap_or_else(|| "Unknown OS".to_string()),
+                os_version: System::os_version().unwrap_or_else(|| "Unknown Version".to_string()),
+            };
+
+            // Return collected stats
+            Ok::<_, ApplicationError>((system_info, memory_stats, current_disk_stats))
+        })
+        .await
+        .map_err(|e| {
+            ApplicationError::InfrastructureError(format!(
+                "System stat gathering task failed: {}",
+                e // JoinError
+            ))
+        })??; // Handle JoinError and inner Result<..., ApplicationError>
+
+        let (system_info, memory_stats, disk_stats) = sys_info_result;
+        debug!(
+            "System stats gathered: {:?}, {:?}, {:?}",
+            system_info, memory_stats, disk_stats
+        );
+
+        // --- Construct Final Response ---
+        Ok(StatsResponse {
+            system_info,
+            memory: memory_stats,
+            disk: disk_stats,
+            engine: engine_stats,
+        })
     }
 }
