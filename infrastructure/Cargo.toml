@@ -1,0 +1,29 @@
+[package]
+name = "infrastructure"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+application = { path = "../application" }
+domain = { path = "../domain" }
+
+# Async runtime features (needed for async trait impls)
+tokio = { workspace = true, features = [
+  "sync",
+] } # Add sync feature for Mutex/RwLock if needed
+
+# For concurrent in-memory storage
+# dashmap provides concurrent HashMaps, suitable for multi-threaded access
+dashmap = "5.5"
+
+# Async trait implementation
+async-trait = { workspace = true }
+
+# Logging facade
+tracing = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# Error handling (optional, could rely on ApplicationError)
+# thiserror = { workspace = true }

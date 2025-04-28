@@ -1,0 +1,29 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Web framework
+axum = "0.7" # Use a recent version (check crates.io for the latest)
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }         # Add if needed for JSON handling in API
+
+# Depend on the application layer
+application = { path = "../application" }
+
+# Depend on the domain layer
+domain = { path = "../domain" }
+
+# Depend on the infrastructure layer
+infrastructure = { path = "../infrastructure" }
+
+# Error handling for API layer might differ or use application errors
+thiserror = { workspace = true }
+# anyhow = { workspace = true } # Optional

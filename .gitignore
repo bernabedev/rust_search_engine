@@ -1,0 +1,34 @@
+# ./ .gitignore
+
+# Rust / Cargo build artifacts
+/target/
+debug/
+*.pdb # Windows debugging symbols
+*.rlib
+*.rmeta
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Cargo lock file (optional - typically committed for binaries/apps, ignored for libraries)
+# For this application workspace, it's recommended to commit Cargo.lock
+# Cargo.lock
+
+# Editor configuration files
+.idea/
+.vscode/
+*.iml
+*.sublime-*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Log files (if any outside target/)
+*.log
+
+# Environment variables file (if used)
+.env*
+# Add any other specific files or directories to ignore

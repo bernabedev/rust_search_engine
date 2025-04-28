@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2" # Use the latest resolver
+members = [
+    "api", "application", "domain", "infrastructure",
+]
+
+[workspace.dependencies]
+# Central place for common dependencies and versions (Optional but good practice)
+tokio = { version = "1", features = ["full"] } # Make full features available to workspace
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "1.0"
+async-trait = "0.1"
+
+[profile.release]
+# Optimization settings for release builds (important for performance)
+lto = true           # Enable Link Time Optimization
+codegen-units = 1    # Maximize optimizations (slower compile, faster runtime)
+panic = 'abort'      # Abort on panic for smaller binary size and potentially faster unwind
+strip = true         # Strip symbols from the binary
+opt-level = 3        # Maximum optimization level
