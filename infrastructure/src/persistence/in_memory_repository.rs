@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use domain::{CollectionSchema, Document, DocumentId};
 use std::sync::Arc;
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 
 // --- Schema Repository Implementation ---
 
@@ -88,10 +88,7 @@ impl DocumentRepository for InMemoryDocumentRepository {
     ) -> Result<(), ApplicationError> {
         debug!(collection = %collection_name, doc_id = %document.id().as_str(), "Saving document to in-memory store");
         // Get or create the inner map for the collection
-        let collection_store = self
-            .store
-            .entry(collection_name.to_string())
-            .or_insert_with(DashMap::new); // Create if doesn't exist
+        let collection_store = self.store.entry(collection_name.to_string()).or_default(); // Create if doesn't exist
 
         // Insert the document (wrapped in Arc)
         collection_store.insert(document.id().clone(), Arc::new(document.clone()));
@@ -139,10 +136,7 @@ impl DocumentRepository for InMemoryDocumentRepository {
     ) -> Result<(), ApplicationError> {
         debug!(collection = %collection_name, count = documents.len(), "Saving batch directly to in-memory store");
         // Get or create the inner map for the collection
-        let collection_store = self
-            .store
-            .entry(collection_name.to_string())
-            .or_insert_with(DashMap::new);
+        let collection_store = self.store.entry(collection_name.to_string()).or_default();
 
         // Insert all documents. DashMap operations are generally thread-safe and efficient.
         // We could potentially use `extend` if the input was consumable, but insert loop is fine.

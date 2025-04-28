@@ -1,14 +1,14 @@
 // ./application/src/lib.rs
 use async_trait::async_trait;
 // Import updated domain types and new errors
-use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldDefinition, FieldType};
+use domain::{CollectionSchema, Document, DocumentId, DomainError};
 // use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Instant}; // For document fields map
 use thiserror::Error;
-use tokio::sync::futures; // For flexible document data
+// For flexible document data
 use tracing::{debug, error, info, instrument, warn};
 
 // --- Application Errors ---
@@ -604,7 +604,7 @@ pub struct SearchService {
 // Sensible maximum limit to prevent abuse
 const MAX_SEARCH_LIMIT: usize = 1000;
 // Default limit if not specified or invalid
-const DEFAULT_SEARCH_LIMIT: usize = 20;
+// const DEFAULT_SEARCH_LIMIT: usize = 20;
 
 impl SearchService {
     pub fn new(schema_repo: Arc<dyn SchemaRepository>, index: Arc<dyn Index>) -> Self {
@@ -668,7 +668,7 @@ impl SearchService {
                 let total_pages = if limit == 0 {
                     0
                 } else {
-                    (nb_hits + limit - 1) / limit
+                    nb_hits.div_ceil(limit)
                 };
                 // Calculate page number (1-based)
                 let page = if limit == 0 { 0 } else { (offset / limit) + 1 };

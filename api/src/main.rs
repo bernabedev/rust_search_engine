@@ -24,8 +24,7 @@ use application::{
     IndexingService,
     ListCollectionsResponse, // New for schema listing
     SchemaService,
-    SearchRequest,
-    SearchResponse, // Existing modified
+    SearchRequest, // Existing modified
     SearchService,
 };
 // Import domain types used directly in API (like CollectionSchema for POST body)

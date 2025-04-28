@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema types
 use std::sync::Arc;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 /// Represents the data stored for a single collection within the in-memory index.
 #[derive(Debug, Default)]

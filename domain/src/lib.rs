@@ -67,6 +67,7 @@ pub struct FieldDefinition {
 
 /// Represents the schema for a collection (index).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct CollectionSchema {
     /// The unique name of the collection. Should follow specific naming rules (e.g., alphanumeric).
     pub name: String,
@@ -77,15 +78,6 @@ pub struct CollectionSchema {
     field_lookup: Option<HashMap<String, FieldDefinition>>,
 }
 
-impl Default for CollectionSchema {
-    fn default() -> Self {
-        CollectionSchema {
-            name: String::new(),
-            fields: Vec::new(),
-            field_lookup: None,
-        }
-    }
-}
 
 impl CollectionSchema {
     /// Validates the schema and precomputes the lookup map.
