@@ -5,8 +5,8 @@ use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldDefinitio
 // use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap; // For document fields map
 use std::sync::Arc;
+use std::{collections::HashMap, time::Instant}; // For document fields map
 use thiserror::Error;
 use tokio::sync::futures; // For flexible document data
 use tracing::{debug, error, info, instrument, warn};
@@ -41,6 +41,15 @@ pub enum ApplicationError {
 }
 
 // --- Infrastructure Interfaces (Traits) ---
+#[derive(Debug)]
+pub struct SearchResult {
+    /// Documents matching the query for the requested page.
+    pub documents: Vec<Document>,
+    /// Total number of documents matching the query before pagination.
+    pub total_hits: usize,
+    // Optional: Add index processing time later if needed
+    // pub index_processing_time_ms: u128,
+}
 
 /// Interface for storing and retrieving Collection Schemas.
 #[async_trait]
@@ -119,7 +128,9 @@ pub trait Index: Send + Sync {
         &self,
         collection_name: &str,
         query: &str,
-    ) -> Result<Vec<Document>, ApplicationError>;
+        offset: usize, // Now required
+        limit: usize,  // Now required
+    ) -> Result<SearchResult, ApplicationError>;
     /// Deletes an entire collection from the index.
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError>;
     /// Indexes multiple documents efficiently.
@@ -174,6 +185,17 @@ pub struct BatchResponse {
 #[derive(Deserialize, Debug)]
 pub struct SearchRequest {
     pub query: String,
+    /// Maximum number of hits to return (page size). Optional.
+    #[serde(default = "default_limit")] // Provide default if missing
+    pub limit: usize,
+    /// Number of hits to skip (for pagination). Optional.
+    #[serde(default)] // Defaults to 0 if missing
+    pub offset: usize,
+}
+
+// Function to provide default limit for serde
+fn default_limit() -> usize {
+    20 // Default page size
 }
 
 /// Includes the ID and all stored fields.
@@ -187,7 +209,22 @@ pub struct SearchHit {
 // SearchResponse remains the same (list of document IDs)
 #[derive(Serialize, Debug)]
 pub struct SearchResponse {
+    /// Array of matching documents for the current page.
     pub hits: Vec<SearchHit>,
+    /// Total number of documents matching the query.
+    pub nb_hits: usize,
+    /// The original search query string.
+    pub query: String,
+    /// The maximum number of hits returned per page.
+    pub limit: usize,
+    /// The number of hits skipped (offset).
+    pub offset: usize,
+    /// The current page number (1-based).
+    pub page: usize,
+    /// Total number of pages available.
+    pub total_pages: usize,
+    /// Time taken by the search operation in milliseconds.
+    pub processing_time_ms: u128,
 }
 
 // --- Application Services (Use Cases) ---
@@ -564,27 +601,39 @@ pub struct SearchService {
     // doc_repo: Arc<dyn DocumentRepository>, // Add later if needed to fetch full docs
 }
 
+// Sensible maximum limit to prevent abuse
+const MAX_SEARCH_LIMIT: usize = 1000;
+// Default limit if not specified or invalid
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+
 impl SearchService {
     pub fn new(schema_repo: Arc<dyn SchemaRepository>, index: Arc<dyn Index>) -> Self {
         Self { schema_repo, index }
     }
 
-    #[instrument(skip(self, request), fields(collection = %collection_name, query = %request.query))]
+    #[instrument(skip(self, request), fields(collection = %collection_name, query = %request.query, limit = request.limit, offset = request.offset))]
     pub async fn search_documents(
         &self,
         collection_name: &str,
-        request: SearchRequest,
+        request: SearchRequest, // Receives the updated request DTO
     ) -> Result<SearchResponse, ApplicationError> {
-        // <-- Return new SearchResponse
-        info!("Attempting to search documents");
+        info!("Attempting to search documents with pagination");
 
-        if request.query.trim().is_empty() {
+        let start_time: Instant = Instant::now(); // Start timing
+
+        // --- Validate Input ---
+        let query = request.query.trim();
+        if query.is_empty() {
             return Err(ApplicationError::InvalidInput(
                 "Search query cannot be empty".to_string(),
             ));
         }
 
-        // 1. Check if collection exists
+        // Apply default and max limit
+        let limit = request.limit.min(MAX_SEARCH_LIMIT).max(1); // Ensure limit is at least 1 and <= MAX
+        let offset = request.offset;
+
+        // --- Check Collection ---
         if self.schema_repo.get(collection_name).await?.is_none() {
             warn!(collection = %collection_name, "Search failed: collection not found");
             return Err(ApplicationError::CollectionNotFound(
@@ -592,29 +641,71 @@ impl SearchService {
             ));
         }
 
-        // 2. Perform the search using the index interface
-        match self.index.search(collection_name, &request.query).await {
-            Ok(documents) => {
-                // <-- Receives Vec<Document>
-                info!(collection = %collection_name, "Search successful, found {} results for query '{}'", documents.len(), request.query);
+        // --- Perform Search ---
+        match self
+            .index
+            .search(collection_name, query, offset, limit)
+            .await
+        {
+            // Pass offset & limit
+            Ok(search_result) => {
+                // Receives SearchResult
+                let duration = start_time.elapsed();
+                let processing_time_ms = duration.as_millis();
 
-                // Convert domain Document objects into SearchHit DTOs
-                let hits: Vec<SearchHit> = documents
+                info!(
+                    collection = %collection_name,
+                    query = %query,
+                    total_hits = search_result.total_hits,
+                    returned_hits = search_result.documents.len(),
+                    time_ms = processing_time_ms,
+                    "Search successful"
+                );
+
+                // --- Calculate Metadata ---
+                let nb_hits = search_result.total_hits;
+                // Avoid division by zero for total_pages
+                let total_pages = if limit == 0 {
+                    0
+                } else {
+                    (nb_hits + limit - 1) / limit
+                };
+                // Calculate page number (1-based)
+                let page = if limit == 0 { 0 } else { (offset / limit) + 1 };
+
+                // --- Map Documents to Hits ---
+                let hits: Vec<SearchHit> = search_result
+                    .documents // Use documents from SearchResult
                     .into_iter()
                     .map(|doc| SearchHit {
-                        id: doc.id().clone().into(),  // Convert DocumentId to String
-                        fields: doc.fields().clone(), // Clone the fields HashMap
+                        id: doc.id().clone().into(),
+                        fields: doc.fields().clone(),
                     })
                     .collect();
 
-                Ok(SearchResponse { hits }) // <-- Construct new response
+                // --- Construct Final Response ---
+                Ok(SearchResponse {
+                    hits,
+                    nb_hits,
+                    query: query.to_string(), // Return the trimmed query used
+                    limit,
+                    offset,
+                    page,
+                    total_pages,
+                    processing_time_ms,
+                })
             }
             Err(e) => {
-                error!(collection = %collection_name, query = %request.query, "Search failed: {}", e);
-                // Wrap the underlying error (using original Error structure is fine)
+                let duration = start_time.elapsed();
+                error!(
+                    collection = %collection_name,
+                    query = %query,
+                    time_ms = duration.as_millis(),
+                    "Search failed: {}", e
+                );
                 Err(ApplicationError::SearchError {
                     collection: collection_name.to_string(),
-                    source: Box::new(e), // The error 'e' might now be Box<dyn Error> or a specific infra error
+                    source: Box::new(e),
                 })
             }
         }

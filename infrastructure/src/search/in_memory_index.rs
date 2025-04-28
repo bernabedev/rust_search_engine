@@ -1,5 +1,5 @@
 // ./infrastructure/src/search/in_memory_index.rs
-use application::{ApplicationError, Index}; // Import trait and error
+use application::{ApplicationError, Index, SearchResult}; // Import trait and error
 use async_trait::async_trait;
 use dashmap::DashMap;
 use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema types
@@ -103,44 +103,70 @@ impl Index for InMemoryIndex {
         &self,
         collection_name: &str,
         query: &str,
-    ) -> Result<Vec<Document>, ApplicationError> {
-        // <-- Return Vec<Document>
-        debug!(collection = %collection_name, query = %query, "Searching in-memory index");
+        offset: usize, // Receive offset
+        limit: usize,  // Receive limit
+    ) -> Result<SearchResult, ApplicationError> {
+        // <-- Return SearchResult
+        debug!(collection = %collection_name, query = %query, offset = offset, limit = limit, "Searching in-memory index with pagination");
 
+        // Basic query validation (although service layer also validates)
         if query.is_empty() {
-            return Ok(vec![]);
+            return Ok(SearchResult {
+                documents: vec![],
+                total_hits: 0,
+            });
         }
         let query_lower = query.to_lowercase();
 
         match self.collections.get(collection_name) {
             Some(collection_data) => {
                 let schema = &collection_data.schema;
-                // Iterate and filter, but collect the full Document now
-                let results: Vec<Document> = collection_data
+
+                // --- Step 1: Find all matching documents (without pagination) ---
+                let all_matching_docs: Vec<Document> = collection_data
                     .documents
                     .iter()
                     .filter_map(|entry| {
-                        let doc_arc = entry.value(); // Get the Arc<Document>
-
-                        // Check only indexed fields of type Text for a match
+                        let doc_arc = entry.value();
                         for field_def in &schema.fields {
                             if field_def.index && field_def.field_type == FieldType::Text {
                                 if let Some(value) = doc_arc.fields().get(&field_def.name) {
                                     if let Some(text) = value.as_str() {
                                         if text.to_lowercase().contains(&query_lower) {
-                                            // Match found, clone the Document from the Arc and return
+                                            // Match found, clone the Document
                                             return Some((**doc_arc).clone());
                                         }
                                     }
                                 }
                             }
                         }
-                        None // No match in this document
+                        None
                     })
+                    .collect(); // Collect all matches first
+
+                // --- Step 2: Get total hits count ---
+                let total_hits = all_matching_docs.len();
+
+                // --- Step 3: Apply pagination ---
+                let paginated_docs: Vec<Document> = all_matching_docs
+                    .into_iter() // Consume the vector
+                    .skip(offset)
+                    .take(limit)
                     .collect();
 
-                debug!(collection = %collection_name, "Found {} results for query '{}'", results.len(), query);
-                Ok(results) // <-- Return the collected Vec<Document>
+                debug!(
+                    collection = %collection_name,
+                    query = %query,
+                    total_hits = total_hits,
+                    returned_hits = paginated_docs.len(),
+                    "In-memory search finished."
+                );
+
+                // --- Step 4: Return SearchResult ---
+                Ok(SearchResult {
+                    documents: paginated_docs, // The documents for the current page
+                    total_hits,                // The total count before pagination
+                })
             }
             None => {
                 warn!(collection = %collection_name, "Search performed on non-existent collection index");
@@ -150,7 +176,6 @@ impl Index for InMemoryIndex {
             }
         }
     }
-
     #[instrument(skip(self))]
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError> {
         debug!(collection = %collection_name, "Deleting collection from in-memory index");
