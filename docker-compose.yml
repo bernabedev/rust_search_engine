@@ -6,7 +6,7 @@ services:
       context: . # Use the current directory as the build context
       dockerfile: Dockerfile # Specify the Dockerfile name
     ports:
-      - "${PORT}:3000"
+      - "${PORT}"
     environment:
       - RUST_LOG=info,api=debug
       - PORT=${PORT}
