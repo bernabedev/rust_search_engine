@@ -3,8 +3,9 @@ use application::{ApplicationError, Index, SearchResult}; // Import trait and er
 use async_trait::async_trait;
 use dashmap::DashMap;
 use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema types
-use std::sync::Arc;
-use tracing::{debug, info, instrument, warn};
+use serde_json::{Number, Value};
+use std::{collections::HashMap, sync::Arc};
+use tracing::{debug, info, instrument, trace, warn};
 
 /// Represents the data stored for a single collection within the in-memory index.
 #[derive(Debug, Default)]
@@ -99,84 +100,6 @@ impl Index for InMemoryIndex {
     }
 
     #[instrument(skip(self))]
-    async fn search(
-        &self,
-        collection_name: &str,
-        query: &str,
-        offset: usize, // Receive offset
-        limit: usize,  // Receive limit
-    ) -> Result<SearchResult, ApplicationError> {
-        // <-- Return SearchResult
-        debug!(collection = %collection_name, query = %query, offset = offset, limit = limit, "Searching in-memory index with pagination");
-
-        // Basic query validation (although service layer also validates)
-        if query.is_empty() {
-            return Ok(SearchResult {
-                documents: vec![],
-                total_hits: 0,
-            });
-        }
-        let query_lower = query.to_lowercase();
-
-        match self.collections.get(collection_name) {
-            Some(collection_data) => {
-                let schema = &collection_data.schema;
-
-                // --- Step 1: Find all matching documents (without pagination) ---
-                let all_matching_docs: Vec<Document> = collection_data
-                    .documents
-                    .iter()
-                    .filter_map(|entry| {
-                        let doc_arc = entry.value();
-                        for field_def in &schema.fields {
-                            if field_def.index && field_def.field_type == FieldType::Text {
-                                if let Some(value) = doc_arc.fields().get(&field_def.name) {
-                                    if let Some(text) = value.as_str() {
-                                        if text.to_lowercase().contains(&query_lower) {
-                                            // Match found, clone the Document
-                                            return Some((**doc_arc).clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .collect(); // Collect all matches first
-
-                // --- Step 2: Get total hits count ---
-                let total_hits = all_matching_docs.len();
-
-                // --- Step 3: Apply pagination ---
-                let paginated_docs: Vec<Document> = all_matching_docs
-                    .into_iter() // Consume the vector
-                    .skip(offset)
-                    .take(limit)
-                    .collect();
-
-                debug!(
-                    collection = %collection_name,
-                    query = %query,
-                    total_hits = total_hits,
-                    returned_hits = paginated_docs.len(),
-                    "In-memory search finished."
-                );
-
-                // --- Step 4: Return SearchResult ---
-                Ok(SearchResult {
-                    documents: paginated_docs, // The documents for the current page
-                    total_hits,                // The total count before pagination
-                })
-            }
-            None => {
-                warn!(collection = %collection_name, "Search performed on non-existent collection index");
-                Err(ApplicationError::CollectionNotFound(
-                    collection_name.to_string(),
-                ))
-            }
-        }
-    }
-    #[instrument(skip(self))]
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError> {
         debug!(collection = %collection_name, "Deleting collection from in-memory index");
         if self.collections.remove(collection_name).is_some() {
@@ -186,6 +109,121 @@ impl Index for InMemoryIndex {
             warn!(collection = %collection_name, "Attempted to delete non-existent collection index");
             // Consider if this should be an error or not. Let's return Ok.
             Ok(())
+        }
+    }
+
+    #[instrument(skip(self, filters))]
+    async fn search(
+        &self,
+        collection_name: &str,
+        query: &str,
+        filters: Option<&HashMap<String, Value>>, // Receive filters map
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchResult, ApplicationError> {
+        debug!(collection = %collection_name, query = %query, has_filters = filters.is_some(), offset, limit, "Searching in-memory index with filters/pagination");
+
+        // Query can be empty if filters are provided
+        if query.is_empty() && filters.is_none() {
+            // Service layer should catch this, but double-check
+            return Err(ApplicationError::InvalidInput(
+                "Search requires a query or filters.".to_string(),
+            ));
+        }
+        let query_lower = query.to_lowercase();
+        let has_query = !query.is_empty();
+
+        match self.collections.get(collection_name) {
+            Some(collection_data) => {
+                let schema_arc = collection_data.schema.clone(); // Clone Arc for use in filter closure
+
+                // --- Step 1: Initial Candidate Selection (Text Query or All Docs) ---
+                // Iterate over documents once
+                let candidates: Vec<Arc<Document>> = collection_data
+                    .documents
+                    .iter()
+                    .filter_map(|entry| {
+                        let doc_arc = entry.value();
+
+                        // If there's a text query, check if it matches first
+                        if has_query {
+                            let mut query_match = false;
+                            for field_def in &schema_arc.fields {
+                                if field_def.index && field_def.field_type == FieldType::Text {
+                                    if let Some(value) = doc_arc.fields().get(&field_def.name) {
+                                        if let Some(text) = value.as_str() {
+                                            if text.to_lowercase().contains(&query_lower) {
+                                                query_match = true;
+                                                break; // Found a match for the query in this doc
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // If query provided but no match found in this doc, skip it
+                            if !query_match {
+                                return None;
+                            }
+                        }
+                        // If no query OR query matched, keep the doc (as Arc) for filtering stage
+                        Some(doc_arc.clone())
+                    })
+                    .collect();
+
+                trace!(count = candidates.len(), "Candidates after query matching");
+
+                // --- Step 2: Apply Filters ---
+                let filtered_docs: Vec<Document> = if let Some(filter_map) = filters {
+                    candidates
+                        .into_iter()
+                        .filter(|doc_arc| {
+                            // Check if this document matches ALL filter conditions
+                            check_doc_matches_filters(doc_arc, &schema_arc, filter_map)
+                        })
+                        .map(|doc_arc| (*doc_arc).clone()) // Clone the Document from Arc if it passes filters
+                        .collect()
+                } else {
+                    // No filters, just clone documents from candidates
+                    candidates
+                        .into_iter()
+                        .map(|doc_arc| (*doc_arc).clone())
+                        .collect()
+                };
+
+                trace!(count = filtered_docs.len(), "Documents after filtering");
+
+                // --- Step 3: Get total hits count (after filtering) ---
+                let total_hits = filtered_docs.len();
+
+                // --- Step 4: Apply pagination ---
+                let paginated_docs: Vec<Document> = filtered_docs
+                    .into_iter() // Consume the vector
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+
+                debug!(
+                    collection = %collection_name,
+                    query = %query,
+                    has_filters = filters.is_some(),
+                    total_hits,
+                    returned_hits = paginated_docs.len(),
+                    "In-memory search finished."
+                );
+
+                // --- Step 5: Return SearchResult ---
+                Ok(SearchResult {
+                    documents: paginated_docs,
+                    total_hits,
+                })
+            }
+            None => {
+                // ... (collection not found error) ...
+                warn!(collection = %collection_name, "Search performed on non-existent collection index");
+                Err(ApplicationError::CollectionNotFound(
+                    collection_name.to_string(),
+                ))
+            }
         }
     }
 
@@ -225,5 +263,151 @@ impl Index for InMemoryIndex {
             .map(|collection_entry| collection_entry.value().documents.len()) // Get count for each collection
             .sum(); // Sum the counts
         Ok(total_count)
+    }
+}
+
+/// Helper function to check if a document matches the provided filters.
+fn check_doc_matches_filters(
+    doc: &Document,
+    schema: &CollectionSchema,
+    filters: &HashMap<String, Value>,
+) -> bool {
+    for (field_name, filter_value) in filters {
+        trace!(doc_id = %doc.id().as_str(), filter_field = field_name, "Applying filter");
+
+        // Get field definition from schema
+        let field_def = match schema.get_field(field_name) {
+            Some(def) => def,
+            None => {
+                trace!(
+                    filter_field = field_name,
+                    "Filter field not in schema, skipping doc."
+                );
+                return false; // Field being filtered on doesn't exist in schema
+            }
+        };
+
+        // Get the actual value from the document
+        let doc_value = match doc.fields().get(field_name) {
+            Some(val) => val,
+            None => {
+                trace!(
+                    filter_field = field_name,
+                    "Field not present in document, skipping doc."
+                );
+                return false; // Field being filtered on doesn't exist in the doc
+            }
+        };
+
+        // Apply the filter based on its structure (simple value vs object with operators)
+        if !match_value(doc_value, filter_value, field_def.field_type.clone()) {
+            trace!(
+                filter_field = field_name,
+                "Filter condition not met, skipping doc."
+            );
+            return false; // This specific filter condition failed
+        }
+    }
+
+    // If we looped through all filters and none returned false, the document matches
+    trace!(doc_id = %doc.id().as_str(), "All filter conditions met.");
+    true
+}
+
+/// Recursive helper to match a document value against a filter value/condition.
+fn match_value(doc_value: &Value, filter_condition: &Value, field_type: FieldType) -> bool {
+    match filter_condition {
+        // Case 1: Filter is a simple value (String, Number, Bool) -> Check for equality
+        Value::String(filter_str) => {
+            doc_value
+                .as_str()
+                .map_or(false, |doc_str| doc_str == filter_str) // Case-sensitive equality for now
+        }
+        Value::Number(filter_num) => {
+            // Compare numbers carefully (allow float vs int comparison if reasonable)
+            doc_value.as_f64().zip(filter_num.as_f64()).map_or(false, |(d, f)| (d - f).abs() < f64::EPSILON) || // float compare
+             doc_value.as_i64().zip(filter_num.as_i64()).map_or(false, |(d, f)| d == f) // int compare
+        }
+        Value::Bool(filter_bool) => doc_value
+            .as_bool()
+            .map_or(false, |doc_bool| doc_bool == *filter_bool),
+
+        // Case 2: Filter is an object -> Check for range operators (gte, lte, gt, lt)
+        Value::Object(filter_ops) => {
+            // Expect numeric or potentially date types for range filters
+            if field_type != FieldType::Number {
+                // Extend later for dates etc.
+                trace!(
+                    "Range filter applied to non-numeric field type {:?}, failing match.",
+                    field_type
+                );
+                return false;
+            }
+
+            let doc_num = match doc_value.as_f64() {
+                // Use f64 for general numeric comparison
+                Some(n) => n,
+                None => {
+                    trace!(
+                        "Document value is not a valid number for range comparison, failing match."
+                    );
+                    return false; // Doc value isn't number, cannot compare range
+                }
+            };
+
+            for (op, op_value) in filter_ops {
+                let op_num = match op_value.as_f64() {
+                    Some(n) => n,
+                    None => {
+                        trace!(
+                            "Filter operator value '{}' is not numeric, failing match.",
+                            op
+                        );
+                        return false; // Filter value for operator isn't number
+                    }
+                };
+
+                match op.as_str() {
+                    "gte" => {
+                        if !(doc_num >= op_num) {
+                            return false;
+                        }
+                    }
+                    "lte" => {
+                        if !(doc_num <= op_num) {
+                            return false;
+                        }
+                    }
+                    "gt" => {
+                        if !(doc_num > op_num) {
+                            return false;
+                        }
+                    }
+                    "lt" => {
+                        if !(doc_num < op_num) {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        trace!("Unsupported filter operator: {}", op);
+                        return false; // Unknown operator
+                    }
+                }
+            }
+            true // All operators in the object matched
+        }
+
+        // Case 3: Filter is an array -> Check if doc_value is IN the array (TODO later)
+        Value::Array(_filter_array) => {
+            // Example: "category": ["electronics", "audio"]
+            warn!("'IN' array filter not implemented yet.");
+            false // Not implemented yet
+        }
+
+        // Other filter types (Null, etc.) are not handled explicitly yet
+        _ => {
+            trace!("Unsupported filter condition type: {:?}", filter_condition);
+            false
+        }
     }
 }

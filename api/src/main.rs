@@ -120,7 +120,7 @@ async fn main() {
         // Search Endpoint (now collection-specific)
         .route(
             "/collections/:collection_name/search",
-            get(search_documents_handler),
+            post(search_documents_handler),
         ) // Search in collection
         // Provide the application state to the handlers
         .with_state(app_state);
@@ -347,19 +347,27 @@ async fn delete_document_handler(
 async fn search_documents_handler(
     State(state): State<AppState>,
     Path(collection_name): Path<String>,
-    Query(params): Query<SearchRequest>,
+    Json(request): Json<SearchRequest>, // <-- Extract SearchRequest from JSON body
 ) -> Response {
-    // Still returns Response
-    info!(collection = %collection_name, query = %params.query, "Received request to search documents");
+    // Log filters if present
+    let filters_present = request.filters.is_some();
+    info!(
+        collection = %collection_name,
+        query = %request.query,
+        has_filters = filters_present,
+        limit = request.limit,
+        offset = request.offset,
+        "Received search request via POST"
+    );
+
+    // Call the service (logic remains the same as it takes SearchRequest)
     match state
         .search_service
-        .search_documents(&collection_name, params)
+        .search_documents(&collection_name, request)
         .await
     {
         Ok(response) => {
-            // response is now the updated SearchResponse { hits: Vec<SearchHit> }
-            info!(collection = %collection_name, "Search completed successfully via handler, {} results", response.hits.len()); // Use hits.len()
-            // JsonResponse will serialize the new SearchResponse structure
+            info!(collection = %collection_name, "Search completed successfully via handler, {} total hits", response.nb_hits);
             (StatusCode::OK, JsonResponse(response)).into_response()
         }
         Err(e) => {

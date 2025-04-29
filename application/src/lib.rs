@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use domain::{CollectionSchema, Document, DocumentId, DomainError};
+use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -39,6 +39,8 @@ pub enum ApplicationError {
 }
 
 // --- Infrastructure Interfaces (Traits) ---
+pub type FilterValue = Value;
+
 #[derive(Debug)]
 pub struct SearchResult {
     /// Documents matching the query for the requested page.
@@ -171,8 +173,9 @@ pub trait Index: Send + Sync {
         &self,
         collection_name: &str,
         query: &str,
-        offset: usize, // Now required
-        limit: usize,  // Now required
+        filters: Option<&HashMap<String, FilterValue>>, // Now optional
+        offset: usize,                                  // Now required
+        limit: usize,                                   // Now required
     ) -> Result<SearchResult, ApplicationError>;
     /// Deletes an entire collection from the index.
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError>;
@@ -230,6 +233,9 @@ pub struct BatchResponse {
 #[derive(Deserialize, Debug)]
 pub struct SearchRequest {
     pub query: String,
+    /// Optional filter conditions (field name -> filter value/object).
+    #[serde(default)]
+    pub filters: Option<HashMap<String, FilterValue>>,
     /// Maximum number of hits to return (page size). Optional.
     #[serde(default = "default_limit")] // Provide default if missing
     pub limit: usize,
@@ -260,6 +266,9 @@ pub struct SearchResponse {
     pub nb_hits: usize,
     /// The original search query string.
     pub query: String,
+    /// Filters that were applied (echoed back from request).
+    #[serde(skip_serializing_if = "Option::is_none")] // Don't show if None
+    pub filters: Option<HashMap<String, FilterValue>>,
     /// The maximum number of hits returned per page.
     pub limit: usize,
     /// The number of hits skipped (offset).
@@ -660,67 +669,72 @@ impl SearchService {
     pub async fn search_documents(
         &self,
         collection_name: &str,
-        request: SearchRequest, // Receives the updated request DTO
+        request: SearchRequest, // Receives the full request DTO from JSON body
     ) -> Result<SearchResponse, ApplicationError> {
-        info!("Attempting to search documents with pagination");
-
-        let start_time: Instant = Instant::now(); // Start timing
+        info!("Attempting search with filters and pagination");
+        let start_time = Instant::now();
 
         // --- Validate Input ---
+        // Query can be empty if filters are present
         let query = request.query.trim();
-        if query.is_empty() {
+        if query.is_empty() && request.filters.is_none() {
             return Err(ApplicationError::InvalidInput(
-                "Search query cannot be empty".to_string(),
+                "Search requires a query or filters.".to_string(),
             ));
         }
 
         // Apply default and max limit
-        let limit = request.limit.min(MAX_SEARCH_LIMIT).max(1); // Ensure limit is at least 1 and <= MAX
+        let limit = request.limit.min(MAX_SEARCH_LIMIT).max(1);
         let offset = request.offset;
+        let filters = request.filters; // Keep filters Option for passing and echoing
 
         // --- Check Collection ---
-        if self.schema_repo.get(collection_name).await?.is_none() {
-            warn!(collection = %collection_name, "Search failed: collection not found");
-            return Err(ApplicationError::CollectionNotFound(
-                collection_name.to_string(),
-            ));
-        }
+        let schema = self
+            .schema_repo
+            .get(collection_name)
+            .await?
+            .ok_or_else(|| {
+                warn!(collection = %collection_name, "Search failed: collection not found");
+                ApplicationError::CollectionNotFound(collection_name.to_string())
+            })?;
+
+        // TODO: Optional: Validate filters against the schema here?
+        // E.g., check if filter fields exist in schema, check if range operators are used on numeric fields.
+        // This adds complexity but improves error feedback. For now, let the index handle it.
 
         // --- Perform Search ---
+        // Pass filters.as_ref() to the index search method
         match self
             .index
-            .search(collection_name, query, offset, limit)
+            .search(collection_name, query, filters.as_ref(), offset, limit)
             .await
         {
-            // Pass offset & limit
             Ok(search_result) => {
-                // Receives SearchResult
                 let duration = start_time.elapsed();
                 let processing_time_ms = duration.as_millis();
 
                 info!(
                     collection = %collection_name,
                     query = %query,
+                    has_filters = filters.is_some(),
                     total_hits = search_result.total_hits,
                     returned_hits = search_result.documents.len(),
                     time_ms = processing_time_ms,
                     "Search successful"
                 );
 
-                // --- Calculate Metadata ---
+                // --- Calculate Metadata --- (same as before)
                 let nb_hits = search_result.total_hits;
-                // Avoid division by zero for total_pages
                 let total_pages = if limit == 0 {
                     0
                 } else {
-                    nb_hits.div_ceil(limit)
+                    (nb_hits + limit - 1) / limit
                 };
-                // Calculate page number (1-based)
                 let page = if limit == 0 { 0 } else { (offset / limit) + 1 };
 
-                // --- Map Documents to Hits ---
+                // --- Map Documents to Hits --- (same as before)
                 let hits: Vec<SearchHit> = search_result
-                    .documents // Use documents from SearchResult
+                    .documents
                     .into_iter()
                     .map(|doc| SearchHit {
                         id: doc.id().clone().into(),
@@ -732,7 +746,8 @@ impl SearchService {
                 Ok(SearchResponse {
                     hits,
                     nb_hits,
-                    query: query.to_string(), // Return the trimmed query used
+                    query: query.to_string(),
+                    filters, // Echo back the filters used
                     limit,
                     offset,
                     page,
@@ -741,6 +756,7 @@ impl SearchService {
                 })
             }
             Err(e) => {
+                // ... (error handling same as before) ...
                 let duration = start_time.elapsed();
                 error!(
                     collection = %collection_name,
