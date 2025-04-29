@@ -7,7 +7,9 @@ use axum::{
     response::{IntoResponse, Json as JsonResponse, Response}, // Use JsonResponse for clarity
     routing::{delete, get, post},                             // Added delete
 };
+use std::env;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, level_filters::LevelFilter, warn};
@@ -42,12 +44,36 @@ struct AppState {
     stats_service: Arc<StatsService>,
 }
 
+const DEFAULT_PORT: u16 = 3000;
+
 // Application entry point
 #[tokio::main]
 async fn main() {
+    let port = match env::var("PORT") {
+        Ok(port_str) => match u16::from_str(&port_str) {
+            Ok(port_num) => {
+                info!("Using port {} from environment variable PORT.", port_num);
+                port_num
+            }
+            Err(_) => {
+                warn!(
+                    "Invalid PORT value '{}' in environment variable. Using default port {}.",
+                    port_str, DEFAULT_PORT
+                );
+                DEFAULT_PORT
+            }
+        },
+        Err(_) => {
+            info!(
+                "PORT environment variable not set. Using default port {}.",
+                DEFAULT_PORT
+            );
+            DEFAULT_PORT
+        }
+    };
+
     // --- Logger Initialization ---
-    // ... (no changes needed)
-    let filter = EnvFilter::builder()
+    let filter: EnvFilter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::registry()
@@ -129,7 +155,7 @@ async fn main() {
 
     // --- Server Startup ---
     // ... (no changes needed)
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Server starting on {}", addr);
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => {
