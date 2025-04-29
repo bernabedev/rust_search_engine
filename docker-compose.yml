@@ -5,7 +5,7 @@ services:
     build:
       context: . # Use the current directory as the build context
       dockerfile: Dockerfile # Specify the Dockerfile name
-    ports:
+    expose:
       - "${PORT}"
     environment:
       - RUST_LOG=info,api=debug
