@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldType};
+use domain::{CollectionSchema, Document, DocumentId, DomainError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Instant};
@@ -48,6 +47,8 @@ pub struct SearchResult {
     pub documents: Vec<Document>,
     /// Total number of documents matching the query before pagination.
     pub total_hits: usize,
+    /// Facet counts for each facet field.
+    pub facet_counts: FacetCounts,
     // Optional: Add index processing time later if needed
     // pub index_processing_time_ms: u128,
 }
@@ -176,6 +177,7 @@ pub trait Index: Send + Sync {
         query: &str,
         filters: Option<&HashMap<String, FilterValue>>, // Now optional
         sort: &[SortBy],
+        facets: &[String],
         offset: usize, // Now required
         limit: usize,  // Now required
     ) -> Result<SearchResult, ApplicationError>;
@@ -247,6 +249,9 @@ pub struct SearchRequest {
     /// Sorting criteria. An empty array means default (no specific sort, usually by internal score/order).
     #[serde(default)]
     pub sort: Vec<SortBy>,
+    /// Facets to retrieve. An empty array means no facets.
+    #[serde(default)]
+    pub facets: Vec<String>,
 }
 
 // Function to provide default limit for serde
@@ -262,6 +267,9 @@ pub struct SearchHit {
     // Maybe add score later: pub score: f32,
 }
 
+/// Type alias for facet counts: FieldName -> (ValueStr -> Count)
+pub type FacetCounts = HashMap<String, HashMap<String, usize>>;
+
 // SearchResponse remains the same (list of document IDs)
 #[derive(Serialize, Debug)]
 pub struct SearchResponse {
@@ -272,8 +280,14 @@ pub struct SearchResponse {
     /// The original search query string.
     pub query: String,
     /// Filters that were applied (echoed back from request).
-    #[serde(skip_serializing_if = "Option::is_none")] // Don't show if None
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<HashMap<String, FilterValue>>,
+    /// Sorting criteria that were applied.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort: Vec<SortBy>,
+    /// Facet counts for each facet field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facet_counts: Option<FacetCounts>,
     /// The maximum number of hits returned per page.
     pub limit: usize,
     /// The number of hits skipped (offset).
@@ -284,9 +298,6 @@ pub struct SearchResponse {
     pub total_pages: usize,
     /// Time taken by the search operation in milliseconds.
     pub processing_time_ms: u128,
-    /// Sorting criteria that were applied.
-    #[serde(skip_serializing_if = "Vec::is_empty")] // Don't include if empty
-    pub sort: Vec<SortBy>,
 }
 
 /// Defines the sort order direction.
@@ -697,17 +708,16 @@ impl SearchService {
         Self { schema_repo, index }
     }
 
-    #[instrument(skip(self, request), fields(collection = %collection_name, query = %request.query, limit = request.limit, offset = request.offset))]
+    #[instrument(skip(self, request), fields(collection = %collection_name, query = %request.query, limit = request.limit, offset = request.offset,facet_count = request.facets.len()))]
     pub async fn search_documents(
         &self,
         collection_name: &str,
-        request: SearchRequest, // Receives the full request DTO from JSON body
+        request: SearchRequest, // Request DTO now includes facets Vec
     ) -> Result<SearchResponse, ApplicationError> {
-        info!("Attempting search with filters and pagination");
+        info!("Attempting search with filters, sorting, facets, and pagination");
         let start_time = Instant::now();
 
-        // --- Validate Input ---
-        // Query can be empty if filters are present
+        // --- Validate Input --- (remains the same)
         let query = request.query.trim();
         if query.is_empty() && request.filters.is_none() {
             return Err(ApplicationError::InvalidInput(
@@ -715,28 +725,27 @@ impl SearchService {
             ));
         }
 
-        // Apply default and max limit
         let limit = request.limit.min(MAX_SEARCH_LIMIT).max(1);
         let offset = request.offset;
-        let filters = request.filters; // Keep filters Option for passing and echoing
+        let filters = request.filters;
         let sort_criteria = request.sort;
+        let facet_fields = request.facets; // Get the requested facet fields Vec
 
-        // --- Check Collection ---
+        // --- Check Collection --- (remains the same)
         let schema = self
             .schema_repo
             .get(collection_name)
             .await?
             .ok_or_else(|| {
+                // ... collection not found error handling ...
                 warn!(collection = %collection_name, "Search failed: collection not found");
                 ApplicationError::CollectionNotFound(collection_name.to_string())
             })?;
 
-        // TODO: Optional: Validate filters against the schema here?
-        // E.g., check if filter fields exist in schema, check if range operators are used on numeric fields.
-        // This adds complexity but improves error feedback. For now, let the index handle it.
+        // TODO: Optional: Validate facet fields against schema (exist? usable type?)
 
         // --- Perform Search ---
-        // Pass filters.as_ref() to the index search method
+        // Pass the facet fields slice to the index search method
         match self
             .index
             .search(
@@ -744,12 +753,14 @@ impl SearchService {
                 query,
                 filters.as_ref(),
                 &sort_criteria,
+                &facet_fields,
                 offset,
                 limit,
             )
             .await
         {
             Ok(search_result) => {
+                // search_result now contains facet_counts
                 let duration = start_time.elapsed();
                 let processing_time_ms = duration.as_millis();
 
@@ -763,7 +774,7 @@ impl SearchService {
                     "Search successful"
                 );
 
-                // --- Calculate Metadata --- (same as before)
+                // --- Calculate Metadata --- (remains the same)
                 let nb_hits = search_result.total_hits;
                 let total_pages = if limit == 0 {
                     0
@@ -772,7 +783,7 @@ impl SearchService {
                 };
                 let page = if limit == 0 { 0 } else { (offset / limit) + 1 };
 
-                // --- Map Documents to Hits --- (same as before)
+                // --- Map Documents to Hits --- (remains the same)
                 let hits: Vec<SearchHit> = search_result
                     .documents
                     .into_iter()
@@ -782,18 +793,27 @@ impl SearchService {
                     })
                     .collect();
 
+                // --- Handle Facet Counts ---
+                let facet_counts_option =
+                    if facet_fields.is_empty() || search_result.facet_counts.is_empty() {
+                        None // Don't include facet_counts in response if not requested or if empty
+                    } else {
+                        Some(search_result.facet_counts)
+                    };
+
                 // --- Construct Final Response ---
                 Ok(SearchResponse {
                     hits,
                     nb_hits,
                     query: query.to_string(),
-                    filters, // Echo back the filters used
+                    filters,
+                    sort: sort_criteria,
+                    facet_counts: facet_counts_option, // Add facet counts
                     limit,
                     offset,
                     page,
                     total_pages,
                     processing_time_ms,
-                    sort: sort_criteria,
                 })
             }
             Err(e) => {

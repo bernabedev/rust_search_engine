@@ -66,8 +66,7 @@ pub struct FieldDefinition {
 }
 
 /// Represents the schema for a collection (index).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionSchema {
     /// The unique name of the collection. Should follow specific naming rules (e.g., alphanumeric).
     pub name: String,
@@ -77,7 +76,6 @@ pub struct CollectionSchema {
     #[serde(skip)] // Don't serialize/deserialize this helper field
     field_lookup: Option<HashMap<String, FieldDefinition>>,
 }
-
 
 impl CollectionSchema {
     /// Validates the schema and precomputes the lookup map.

@@ -1,9 +1,10 @@
-use application::{ApplicationError, Index, SearchResult, SortBy, SortOrder};
+use application::{ApplicationError, FacetCounts, Index, SearchResult, SortBy, SortOrder};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema type
 use serde_json::{Number, Value};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -112,22 +113,21 @@ impl Index for InMemoryIndex {
         }
     }
 
-    #[instrument(skip(self, filters, sort))]
+    #[instrument(skip(self, filters, sort, facets))]
     async fn search(
         &self,
         collection_name: &str,
         query: &str,
         filters: Option<&HashMap<String, Value>>,
-        sort: &[SortBy], // <-- Receive sort slice (Added based on Step 11 design)
+        sort: &[SortBy],
+        facets: &[String], // <-- Receive facets slice (Added from Step 12 design)
         offset: usize,
         limit: usize,
     ) -> Result<SearchResult, ApplicationError> {
-        // Returns SearchResult
-        debug!(collection = %collection_name, query = %query, has_filters = filters.is_some(), sort_count = sort.len(), offset, limit, "Searching in-memory index");
+        debug!(collection = %collection_name, query = %query, has_filters = filters.is_some(), sort_count = sort.len(), facet_count = facets.len(), offset, limit, "Searching in-memory index");
 
         // Query can be empty if filters are provided
         if query.is_empty() && filters.is_none() {
-            // Service layer should catch this, but double-check
             return Err(ApplicationError::InvalidInput(
                 "Search requires a query or filters.".to_string(),
             ));
@@ -139,14 +139,17 @@ impl Index for InMemoryIndex {
             Some(collection_data) => {
                 let schema_arc = collection_data.schema.clone();
 
-                // --- Step 1: Initial Candidate Selection (Query) ---
-                let candidates: Vec<Arc<Document>> = collection_data
+                // --- Step 1 & 2: Get Filtered Document List ---
+                // Combine query matching and filtering to get the base set of documents
+                let filtered_docs: Vec<Document> = collection_data
                     .documents
                     .iter()
                     .filter_map(|entry| {
                         let doc_arc = entry.value();
+                        // Check query first if applicable
                         if has_query {
                             let mut query_match = false;
+                            // ... (query matching logic as before) ...
                             for field_def in &schema_arc.fields {
                                 if field_def.index && field_def.field_type == FieldType::Text {
                                     if let Some(value) = doc_arc.fields().get(&field_def.name) {
@@ -163,36 +166,38 @@ impl Index for InMemoryIndex {
                                 return None;
                             }
                         }
-                        Some(doc_arc.clone())
+                        // Then check filters if applicable
+                        if let Some(filter_map) = filters {
+                            if !check_doc_matches_filters(doc_arc, &schema_arc, filter_map) {
+                                return None; // Filtered out
+                            }
+                        }
+                        // If passed query and filters, clone the document
+                        Some((**doc_arc).clone())
                     })
                     .collect();
-                trace!(count = candidates.len(), "Candidates after query matching");
+                trace!(
+                    count = filtered_docs.len(),
+                    "Documents after query & filtering"
+                );
 
-                // --- Step 2: Apply Filters ---
-                let filtered_docs: Vec<Document> = if let Some(filter_map) = filters {
-                    candidates
-                        .into_iter()
-                        .filter(|doc_arc| {
-                            check_doc_matches_filters(doc_arc, &schema_arc, filter_map)
-                        })
-                        .map(|doc_arc| (*doc_arc).clone())
-                        .collect()
+                // --- Step 3: Calculate Facets (on filtered docs) --- <--- NEW STEP ---
+                let calculated_facet_counts: FacetCounts = if !facets.is_empty() {
+                    trace!(requested_facets = ?facets, "Calculating facet counts");
+                    calculate_facets(&filtered_docs, facets) // Use the helper function
                 } else {
-                    candidates
-                        .into_iter()
-                        .map(|doc_arc| (*doc_arc).clone())
-                        .collect()
+                    trace!("No facets requested.");
+                    HashMap::new()
                 };
-                trace!(count = filtered_docs.len(), "Documents after filtering");
 
-                // --- Step 3: Apply Sorting --- <--- NEW STEP INSERTED HERE ---
-                let mut sorted_docs = filtered_docs; // Get mutable ownership
+                // --- Step 4: Apply Sorting (on filtered docs) ---
+                let mut sorted_docs = filtered_docs; // Sort the results from filtering
 
                 if !sort.is_empty() {
                     trace!(sort_criteria = ?sort, "Applying sort criteria");
                     sorted_docs.sort_unstable_by(|a, b| {
+                        // ... (sorting comparison logic remains the same) ...
                         for sort_by in sort {
-                            // Iterate through each sort criterion
                             let field_name = &sort_by.field;
                             let val_a = a.fields().get(field_name);
                             let val_b = b.fields().get(field_name);
@@ -202,41 +207,39 @@ impl Index for InMemoryIndex {
                                 SortOrder::Desc => comparison.reverse(),
                             };
                             if result != Ordering::Equal {
-                                return result; // Use this criterion's result
+                                return result;
                             }
-                            // Otherwise, continue to the next criterion (tie-breaker)
                         }
-                        Ordering::Equal // All criteria are equal
+                        Ordering::Equal
                     });
                     trace!(count = sorted_docs.len(), "Documents after sorting");
                 } else {
                     trace!("No sorting criteria provided.");
                 }
 
-                // --- Step 4: Get total hits count (based on filtered/sorted list before pagination) ---
-                let total_hits = sorted_docs.len(); // Count remains the same after sorting
+                // --- Step 5: Get total hits count (based on list *before* pagination) ---
+                let total_hits = sorted_docs.len(); // Count before pagination is applied
 
-                // --- Step 5: Apply pagination --- (Operates on sorted_docs now)
-                let paginated_docs: Vec<Document> = sorted_docs // Paginate the sorted list
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .collect();
+                // --- Step 6: Apply pagination (on sorted docs) ---
+                let paginated_docs: Vec<Document> =
+                    sorted_docs.into_iter().skip(offset).take(limit).collect();
 
                 debug!(
                     collection = %collection_name,
                     query = %query,
                     has_filters = filters.is_some(),
-                    sort_count = sort.len(), // Log sort count
+                    sort_count = sort.len(),
+                    facet_count = facets.len(), // Log facet request count
                     total_hits,
                     returned_hits = paginated_docs.len(),
                     "In-memory search finished."
                 );
 
-                // --- Step 6: Return SearchResult ---
+                // --- Step 7: Return SearchResult ---
                 Ok(SearchResult {
                     documents: paginated_docs,
                     total_hits,
+                    facet_counts: calculated_facet_counts, // <-- Include calculated facets
                 })
             }
             None => {
@@ -465,4 +468,40 @@ fn compare_json_values(a: &Value, b: &Value) -> Ordering {
         return Ordering::Greater;
     }
     Ordering::Equal // Fallback for mismatched/unhandled types
+}
+
+fn calculate_facets(docs: &[Document], facet_fields: &[String]) -> FacetCounts {
+    let mut facet_counts: FacetCounts = HashMap::new();
+    // Use HashSet for faster checking if a field is requested for faceting
+    let requested_facets: HashSet<&str> = facet_fields.iter().map(String::as_str).collect();
+
+    if requested_facets.is_empty() {
+        return facet_counts; // No facets requested
+    }
+
+    for doc in docs {
+        for (field_name, doc_value) in doc.fields() {
+            // Only process fields requested for faceting
+            if requested_facets.contains(field_name.as_str()) {
+                // Convert the document value to a string representation for the facet key
+                let facet_key = match doc_value {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Bool(b) => Some(b.to_string()),
+                    // TODO: Handle arrays later - iterate or skip? For now, skip.
+                    // Value::Array(_) => Some("[array]".to_string()), // Or skip
+                    // Skip Null, Object, Array for faceting for now
+                    _ => None,
+                };
+
+                if let Some(key) = facet_key {
+                    // Get the map for the current field_name, or insert a new one
+                    let field_map = facet_counts.entry(field_name.clone()).or_default();
+                    // Increment the count for the specific value (key)
+                    field_map.entry(key).and_modify(|c| *c += 1).or_insert(1);
+                }
+            }
+        }
+    }
+    facet_counts
 }
