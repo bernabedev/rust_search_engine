@@ -12,8 +12,7 @@ services:
       - PORT=${PORT}
     restart: unless-stopped # Restart policy
     healthcheck:
-      # Check if the /health endpoint is responding
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${PORT}/health || exit 1"]
       interval: 15s # Check every 15 seconds
       timeout: 5s # Wait max 5 seconds for response
       retries: 3 # Try 3 times before marking as unhealthy
