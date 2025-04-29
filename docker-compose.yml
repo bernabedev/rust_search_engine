@@ -17,3 +17,10 @@ services:
       timeout: 5s # Wait max 5 seconds for response
       retries: 3 # Try 3 times before marking as unhealthy
       start_period: 20s # Grace period after container starts
+
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
