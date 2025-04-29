@@ -28,6 +28,11 @@ RUN cargo build --release --locked --bin api
 # (This stage remains the same as before)
 FROM debian:bookworm-slim
 
+# Install curl for health checks
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+
 ARG APP_USER=appuser
 RUN sh -c 'groupadd -r ${APP_USER} && useradd --no-log-init -r -g ${APP_USER} ${APP_USER}'
 
