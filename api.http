@@ -1,0 +1,256 @@
+# REST Client requests for the Rust Search Engine API.
+
+# --- Variables ---
+# Base URL of the running search engine (local Docker)
+@baseUrl = http://localhost:3000
+
+# API Key Placeholder - Replace with actual key when auth is implemented
+# NOTE: Authentication is NOT YET IMPLEMENTED in the engine. Header is a placeholder.
+@apiKey = your-placeholder-api-key
+
+# Collection name used for most examples
+@collectionName = products
+
+###
+# ==============================================================================
+# Health Check (No Authentication Needed)
+# ==============================================================================
+
+# @name HealthCheck
+# Check if the server is running and accessible.
+GET {{baseUrl}}/health
+
+
+###
+# ==============================================================================
+# Stats API (Authentication Placeholder)
+# ==============================================================================
+
+# @name GetStats
+# Retrieve system resource usage and engine statistics.
+GET {{baseUrl}}/stats
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Accept: application/json
+
+
+###
+# ==============================================================================
+# Collection Management API (Authentication Placeholder)
+# ==============================================================================
+
+# @name CreateProductsCollection
+# Creates a new collection named 'products' with a specific schema.
+POST {{baseUrl}}/collections
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+
+{
+  "name": "products",
+  "fields": [
+    { "name": "code", "type": "number", "index": true, "optional": false },
+    { "name": "brand", "type": "text", "index": true, "optional": false },
+    { "name": "category_id", "type": "number", "index": true, "optional": false },
+    { "name": "category_name", "type": "text", "index": true, "optional": false },
+    { "name": "color", "type": "text", "index": true, "optional": true },
+    { "name": "description", "type": "text", "index": true, "optional": false },
+    { "name": "model", "type": "text", "index": true, "optional": false },
+    { "name": "sales_last_60_days", "type": "number", "index": true, "optional": true },
+    { "name": "storage", "type": "text", "index": false, "optional": true },
+    { "name": "thumbnail", "type": "text", "index": false, "optional": true },
+    { "name": "weight", "type": "number", "index": false, "optional": true },
+    { "name": "width", "type": "number", "index": false, "optional": true },
+    { "name": "sub_category_id", "type": "number", "index": true, "optional": false },
+    { "name": "sub_category_name", "type": "text", "index": true, "optional": false },
+    { "name": "price", "type": "number", "index": true, "optional": false },
+    { "name": "price_without_tax", "type": "number", "index": false, "optional": true },
+    { "name": "price_tax", "type": "number", "index": false, "optional": true },
+    { "name": "stock", "type": "number", "index": true, "optional": false }
+  ]
+}
+
+###
+
+# @name ListCollections
+# Retrieve a list of all existing collection names.
+GET {{baseUrl}}/collections
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Accept: application/json
+
+###
+
+# @name GetCollectionSchema
+# Retrieve the schema configuration for a specific collection.
+GET {{baseUrl}}/collections/{{collectionName}}
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Accept: application/json
+
+###
+
+# @name DeleteCollection
+# Delete a collection and all its associated data.
+# NOTE: Use with caution! This action is irreversible without re-indexing.
+DELETE {{baseUrl}}/collections/{{collectionName}}
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+
+
+###
+# ==============================================================================
+# Document Management API (Authentication Placeholder)
+# ==============================================================================
+
+# @name IndexSingleDocument
+# Add or replace a single document in the specified collection.
+# Document ID should match the idField defined in the collection schema.
+POST {{baseUrl}}/collections/{{collectionName}}/documents
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+
+{
+  "id": "prod_12345",
+  "fields": {
+    "code": 12345,
+    "brand": "ExampleBrand",
+    "category_id": 10,
+    "category_name": "Electronics Components",
+    "color": "Black",
+    "description": "High-performance CPU model X2000 with 8 cores",
+    "model": "X2000",
+    "sales_last_60_days": 150,
+    "storage": "",
+    "thumbnail": "https://example.com/image.jpg",
+    "weight": 0.1,
+    "width": 5,
+    "sub_category_id": 101,
+    "sub_category_name": "Processors",
+    "price": 350.75,
+    "price_without_tax": 300,
+    "price_tax": 50.75,
+    "stock": 50
+  }
+}
+
+###
+
+# @name IndexBatchDocuments
+# Add or replace multiple documents in a single request.
+POST {{baseUrl}}/collections/{{collectionName}}/documents/batch
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+
+[
+  {
+    "id": "prod_67890",
+    "fields": {
+      "code": 67890, "brand": "AnotherBrand", "category_id": 11, "category_name": "Peripherals",
+      "description": "Wireless Optical Mouse", "model": "WM-100", "price": 25.99, "stock": 200, "color": "Red"
+    }
+  },
+  {
+    "id": "prod_11223",
+    "fields": {
+      "code": 11223, "brand": "ExampleBrand", "category_id": 10, "category_name": "Electronics Components",
+      "description": "RAM Module 16GB DDR4", "model": "MEM-16G", "price": 75.00, "stock": 120
+    }
+  }
+]
+
+###
+
+# @name DeleteSingleDocument
+# Delete a single document by its ID.
+DELETE {{baseUrl}}/collections/{{collectionName}}/documents/prod_12345
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+
+###
+# NOTE: GET/PUT endpoints for single documents are not yet implemented.
+# Retrieving documents happens via the Search API.
+# Updating documents requires re-POSTing the document with the same ID.
+###
+
+###
+# ==============================================================================
+# Search API (Authentication Placeholder)
+# ==============================================================================
+
+# @name SearchPOST_BasicQuery
+# Perform a basic search query using the POST method.
+POST {{baseUrl}}/collections/{{collectionName}}/search
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+Accept: application/json
+
+{
+  "query": "colchon",
+  "limit": 5
+}
+
+###
+
+# @name SearchPOST_FilterExact
+# Search with an exact match filter.
+POST {{baseUrl}}/collections/{{collectionName}}/search
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+Accept: application/json
+
+{
+  "query": "colchon",
+  "filters": {
+    "brand": "DREAMLINE"
+  }
+}
+
+###
+
+# @name SearchPOST_FilterRange
+# Search with a numeric range filter (price >= 300 AND price < 400).
+POST {{baseUrl}}/collections/{{collectionName}}/search
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+Accept: application/json
+
+{
+  "query": "colchon",
+  "filters": {
+    "price": { "gte": 1000, "lt": 2000 }
+  }
+}
+
+###
+
+# @name SearchPOST_Sort
+# Search and sort results by price descending, then brand ascending.
+POST {{baseUrl}}/collections/{{collectionName}}/search
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+Accept: application/json
+
+{
+  "query": "colchon",
+  "sort": [
+    { "field": "price", "order": "desc" },
+    { "field": "brand", "order": "asc" }
+  ]
+}
+
+###
+
+# @name SearchPOST_Combined
+# Combine query, filter, sort, and pagination.
+POST {{baseUrl}}/collections/{{collectionName}}/search
+# Authorization: Bearer {{apiKey}} # Uncomment when auth is added
+Content-Type: application/json
+Accept: application/json
+
+{
+  "query": "colchon",
+  "limit": 10,
+  "offset": 0,
+  "filters": {
+    "stock": { "gt": 3 },
+    "brand": "DREAMLINE"
+  },
+  "sort": [
+    { "field": "price", "order": "asc" }
+  ]
+}
