@@ -2,7 +2,7 @@
 use axum::{
     Json,
     Router,
-    extract::{Path, Query, State}, // Added Path extractor
+    extract::{Path, State}, // Added Path extractor
     http::StatusCode,
     response::{IntoResponse, Json as JsonResponse, Response}, // Use JsonResponse for clarity
     routing::{delete, get, post},                             // Added delete
