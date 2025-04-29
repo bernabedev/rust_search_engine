@@ -1,6 +1,5 @@
 services:
   search_engine:
-    container_name: rust-search-engine-app # Explicit container name
     image: rust-search-engine:latest # Optional: Tag the image being built
     build:
       context: . # Use the current directory as the build context
