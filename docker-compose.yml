@@ -6,9 +6,10 @@ services:
       context: . # Use the current directory as the build context
       dockerfile: Dockerfile # Specify the Dockerfile name
     ports:
-      - "3000:3000"
+      - "${PORT}:3000"
     environment:
       - RUST_LOG=info,api=debug
+      - PORT=${PORT}
     restart: unless-stopped # Restart policy
     healthcheck:
       # Check if the /health endpoint is responding
