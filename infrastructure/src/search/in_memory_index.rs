@@ -1,9 +1,9 @@
-// ./infrastructure/src/search/in_memory_index.rs
-use application::{ApplicationError, Index, SearchResult}; // Import trait and error
+use application::{ApplicationError, Index, SearchResult, SortBy, SortOrder};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema types
+use domain::{CollectionSchema, Document, DocumentId, FieldType}; // Import Schema type
 use serde_json::{Number, Value};
+use std::cmp::Ordering;
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -112,16 +112,18 @@ impl Index for InMemoryIndex {
         }
     }
 
-    #[instrument(skip(self, filters))]
+    #[instrument(skip(self, filters, sort))]
     async fn search(
         &self,
         collection_name: &str,
         query: &str,
-        filters: Option<&HashMap<String, Value>>, // Receive filters map
+        filters: Option<&HashMap<String, Value>>,
+        sort: &[SortBy], // <-- Receive sort slice (Added based on Step 11 design)
         offset: usize,
         limit: usize,
     ) -> Result<SearchResult, ApplicationError> {
-        debug!(collection = %collection_name, query = %query, has_filters = filters.is_some(), offset, limit, "Searching in-memory index with filters/pagination");
+        // Returns SearchResult
+        debug!(collection = %collection_name, query = %query, has_filters = filters.is_some(), sort_count = sort.len(), offset, limit, "Searching in-memory index");
 
         // Query can be empty if filters are provided
         if query.is_empty() && filters.is_none() {
@@ -135,17 +137,14 @@ impl Index for InMemoryIndex {
 
         match self.collections.get(collection_name) {
             Some(collection_data) => {
-                let schema_arc = collection_data.schema.clone(); // Clone Arc for use in filter closure
+                let schema_arc = collection_data.schema.clone();
 
-                // --- Step 1: Initial Candidate Selection (Text Query or All Docs) ---
-                // Iterate over documents once
+                // --- Step 1: Initial Candidate Selection (Query) ---
                 let candidates: Vec<Arc<Document>> = collection_data
                     .documents
                     .iter()
                     .filter_map(|entry| {
                         let doc_arc = entry.value();
-
-                        // If there's a text query, check if it matches first
                         if has_query {
                             let mut query_match = false;
                             for field_def in &schema_arc.fields {
@@ -154,22 +153,19 @@ impl Index for InMemoryIndex {
                                         if let Some(text) = value.as_str() {
                                             if text.to_lowercase().contains(&query_lower) {
                                                 query_match = true;
-                                                break; // Found a match for the query in this doc
+                                                break;
                                             }
                                         }
                                     }
                                 }
                             }
-                            // If query provided but no match found in this doc, skip it
                             if !query_match {
                                 return None;
                             }
                         }
-                        // If no query OR query matched, keep the doc (as Arc) for filtering stage
                         Some(doc_arc.clone())
                     })
                     .collect();
-
                 trace!(count = candidates.len(), "Candidates after query matching");
 
                 // --- Step 2: Apply Filters ---
@@ -177,27 +173,52 @@ impl Index for InMemoryIndex {
                     candidates
                         .into_iter()
                         .filter(|doc_arc| {
-                            // Check if this document matches ALL filter conditions
                             check_doc_matches_filters(doc_arc, &schema_arc, filter_map)
                         })
-                        .map(|doc_arc| (*doc_arc).clone()) // Clone the Document from Arc if it passes filters
+                        .map(|doc_arc| (*doc_arc).clone())
                         .collect()
                 } else {
-                    // No filters, just clone documents from candidates
                     candidates
                         .into_iter()
                         .map(|doc_arc| (*doc_arc).clone())
                         .collect()
                 };
-
                 trace!(count = filtered_docs.len(), "Documents after filtering");
 
-                // --- Step 3: Get total hits count (after filtering) ---
-                let total_hits = filtered_docs.len();
+                // --- Step 3: Apply Sorting --- <--- NEW STEP INSERTED HERE ---
+                let mut sorted_docs = filtered_docs; // Get mutable ownership
 
-                // --- Step 4: Apply pagination ---
-                let paginated_docs: Vec<Document> = filtered_docs
-                    .into_iter() // Consume the vector
+                if !sort.is_empty() {
+                    trace!(sort_criteria = ?sort, "Applying sort criteria");
+                    sorted_docs.sort_unstable_by(|a, b| {
+                        for sort_by in sort {
+                            // Iterate through each sort criterion
+                            let field_name = &sort_by.field;
+                            let val_a = a.fields().get(field_name);
+                            let val_b = b.fields().get(field_name);
+                            let comparison = compare_option_json_values(val_a, val_b);
+                            let result = match sort_by.order {
+                                SortOrder::Asc => comparison,
+                                SortOrder::Desc => comparison.reverse(),
+                            };
+                            if result != Ordering::Equal {
+                                return result; // Use this criterion's result
+                            }
+                            // Otherwise, continue to the next criterion (tie-breaker)
+                        }
+                        Ordering::Equal // All criteria are equal
+                    });
+                    trace!(count = sorted_docs.len(), "Documents after sorting");
+                } else {
+                    trace!("No sorting criteria provided.");
+                }
+
+                // --- Step 4: Get total hits count (based on filtered/sorted list before pagination) ---
+                let total_hits = sorted_docs.len(); // Count remains the same after sorting
+
+                // --- Step 5: Apply pagination --- (Operates on sorted_docs now)
+                let paginated_docs: Vec<Document> = sorted_docs // Paginate the sorted list
+                    .into_iter()
                     .skip(offset)
                     .take(limit)
                     .collect();
@@ -206,12 +227,13 @@ impl Index for InMemoryIndex {
                     collection = %collection_name,
                     query = %query,
                     has_filters = filters.is_some(),
+                    sort_count = sort.len(), // Log sort count
                     total_hits,
                     returned_hits = paginated_docs.len(),
                     "In-memory search finished."
                 );
 
-                // --- Step 5: Return SearchResult ---
+                // --- Step 6: Return SearchResult ---
                 Ok(SearchResult {
                     documents: paginated_docs,
                     total_hits,
@@ -410,4 +432,37 @@ fn match_value(doc_value: &Value, filter_condition: &Value, field_type: FieldTyp
             false
         }
     }
+}
+
+/// Helper function to compare Option<Value> for sorting
+fn compare_option_json_values(opt_a: Option<&Value>, opt_b: Option<&Value>) -> Ordering {
+    match (opt_a, opt_b) {
+        (Some(a), Some(b)) => compare_json_values(a, b),
+        (Some(_), None) => Ordering::Greater, // Values > missing/null
+        (None, Some(_)) => Ordering::Less,    // missing/null < Values
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compares two non-optional &Value based on their underlying type.
+fn compare_json_values(a: &Value, b: &Value) -> Ordering {
+    if let (Some(num_a), Some(num_b)) = (a.as_f64(), b.as_f64()) {
+        return num_a.partial_cmp(&num_b).unwrap_or(Ordering::Equal);
+    }
+    if let (Some(str_a), Some(str_b)) = (a.as_str(), b.as_str()) {
+        return str_a.cmp(str_b);
+    }
+    if let (Some(bool_a), Some(bool_b)) = (a.as_bool(), b.as_bool()) {
+        return bool_a.cmp(&bool_b);
+    }
+    if a.is_null() && b.is_null() {
+        return Ordering::Equal;
+    }
+    if a.is_null() {
+        return Ordering::Less;
+    } // nulls first
+    if b.is_null() {
+        return Ordering::Greater;
+    }
+    Ordering::Equal // Fallback for mismatched/unhandled types
 }

@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use domain::{CollectionSchema, Document, DocumentId, DomainError, FieldType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{collections::HashMap, time::Instant}; // For document fields map
+use std::{collections::HashMap, time::Instant};
 use sysinfo::{Disks, MemoryRefreshKind, Pid, System};
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -174,8 +175,9 @@ pub trait Index: Send + Sync {
         collection_name: &str,
         query: &str,
         filters: Option<&HashMap<String, FilterValue>>, // Now optional
-        offset: usize,                                  // Now required
-        limit: usize,                                   // Now required
+        sort: &[SortBy],
+        offset: usize, // Now required
+        limit: usize,  // Now required
     ) -> Result<SearchResult, ApplicationError>;
     /// Deletes an entire collection from the index.
     async fn delete_collection(&self, collection_name: &str) -> Result<(), ApplicationError>;
@@ -242,6 +244,9 @@ pub struct SearchRequest {
     /// Number of hits to skip (for pagination). Optional.
     #[serde(default)] // Defaults to 0 if missing
     pub offset: usize,
+    /// Sorting criteria. An empty array means default (no specific sort, usually by internal score/order).
+    #[serde(default)]
+    pub sort: Vec<SortBy>,
 }
 
 // Function to provide default limit for serde
@@ -279,6 +284,33 @@ pub struct SearchResponse {
     pub total_pages: usize,
     /// Time taken by the search operation in milliseconds.
     pub processing_time_ms: u128,
+    /// Sorting criteria that were applied.
+    #[serde(skip_serializing_if = "Vec::is_empty")] // Don't include if empty
+    pub sort: Vec<SortBy>,
+}
+
+/// Defines the sort order direction.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+/// Defines a single sort criterion (field and order).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SortBy {
+    pub field: String,
+    /// Defaults to ascending if not specified in the JSON request.
+    #[serde(default)] // Default will use SortOrder::default() which we need to implement
+    pub order: SortOrder,
+}
+
+// Implement Default for SortOrder so serde can use it
+impl Default for SortOrder {
+    fn default() -> Self {
+        SortOrder::Asc // Default sort order is Ascending
+    }
 }
 
 // --- Application Services (Use Cases) ---
@@ -687,6 +719,7 @@ impl SearchService {
         let limit = request.limit.min(MAX_SEARCH_LIMIT).max(1);
         let offset = request.offset;
         let filters = request.filters; // Keep filters Option for passing and echoing
+        let sort_criteria = request.sort;
 
         // --- Check Collection ---
         let schema = self
@@ -706,7 +739,14 @@ impl SearchService {
         // Pass filters.as_ref() to the index search method
         match self
             .index
-            .search(collection_name, query, filters.as_ref(), offset, limit)
+            .search(
+                collection_name,
+                query,
+                filters.as_ref(),
+                &sort_criteria,
+                offset,
+                limit,
+            )
             .await
         {
             Ok(search_result) => {
@@ -753,6 +793,7 @@ impl SearchService {
                     page,
                     total_pages,
                     processing_time_ms,
+                    sort: sort_criteria,
                 })
             }
             Err(e) => {
